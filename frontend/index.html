@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Browser Key Authentication — Prototype</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <main class="page">
+    <header class="masthead">
+      <div class="mark" aria-hidden="true">◇</div>
+      <div><p class="eyebrow">SECURITY PROTOTYPE</p><h1>Browser Key Authentication</h1>
+      <p class="subtitle">Password-encrypted private keys · Signed API requests · No bearer session cookies</p></div>
+      <span id="status" class="status">Starting…</span>
+    </header>
+
+    <section id="notice" class="notice" role="status" aria-live="polite" hidden></section>
+
+    <div class="layout">
+      <section class="panel" aria-labelledby="credentials-title">
+        <div class="panel-head"><span class="step">01</span><h2 id="credentials-title">Credentials</h2></div>
+        <div id="stored-section" hidden>
+          <p class="hint">Encrypted private keys stored in this browser:</p>
+          <label for="account">Local account</label>
+          <select id="account"></select>
+          <form id="unlock-form">
+            <label for="unlock-password">Password to unlock private key</label>
+            <input id="unlock-password" type="password" autocomplete="current-password" required>
+            <button type="submit" class="primary" id="unlock-button">Unlock key</button>
+          </form>
+          <div class="actions">
+            <button id="export-button" type="button" class="secondary">Export encrypted backup</button>
+            <button id="delete-button" type="button" class="danger">Delete local key</button>
+          </div>
+          <p class="hint small">Delete removes this browser's copy only. It does <strong>not</strong> revoke the account on the server.</p>
+        </div>
+        <div id="unlocked-section" hidden>
+          <p class="success" id="unlocked-account"></p>
+          <p class="hint">The private key is unlocked in this page's memory. It is non-extractable and can sign requests until you lock it.</p>
+          <button id="lock-button" class="secondary" type="button">Lock now</button>
+        </div>
+        <div class="separator"><span>REGISTER OR RESTORE</span></div>
+        <details id="register-details">
+          <summary>Register a new account</summary>
+          <form id="register-form">
+            <p class="hint">An administrator must allowlist your email. Enter the one-time invite code printed in the Node server terminal.</p>
+            <label for="register-email">Email address</label>
+            <input id="register-email" type="email" autocomplete="email" placeholder="alice@example.com" required>
+            <label for="register-invite">One-time invitation code</label>
+            <input id="register-invite" type="text" autocomplete="off" spellcheck="false" required>
+            <label for="register-password">Choose encryption password (12+ characters)</label>
+            <input id="register-password" type="password" minlength="12" maxlength="256" autocomplete="new-password" required>
+            <label for="register-password-confirm">Confirm password</label>
+            <input id="register-password-confirm" type="password" minlength="12" autocomplete="new-password" required>
+            <button type="submit" class="primary">Authorize and register</button>
+          </form>
+        </details>
+        <details id="import-details">
+          <summary>Import an encrypted key backup</summary>
+          <form id="import-form">
+            <label for="import-file">Backup JSON file</label>
+            <input id="import-file" type="file" accept=".json,application/json" required>
+            <label for="import-password">Backup encryption password</label>
+            <input id="import-password" type="password" autocomplete="current-password" required>
+            <button type="submit" class="secondary">Validate and import</button>
+          </form>
+        </details>
+      </section>
+
+      <section class="panel" aria-labelledby="api-title">
+        <div class="panel-head"><span class="step">02</span><h2 id="api-title">Signed API requests</h2></div>
+        <p class="hint">Every protected call requests a fresh server challenge, then signs the method, URL, exact body digest, identity, and nonce.</p>
+        <div id="api-locked" class="locked-message">Unlock a local key to make authenticated requests.</div>
+        <div id="api-unlocked" hidden>
+          <div class="actions">
+            <button id="me-button" class="primary" type="button">GET /api/private/me</button>
+            <button id="notes-button" class="secondary" type="button">GET /api/private/notes</button>
+          </div>
+          <form id="note-form">
+            <label for="note-text">Create a private note</label>
+            <textarea id="note-text" maxlength="240" rows="3" placeholder="Only signed requests can add notes" required></textarea>
+            <button type="submit" class="primary">POST signed note</button>
+          </form>
+          <div id="notes" class="note-list" hidden></div>
+        </div>
+        <div class="separator"><span>SECURITY TESTS</span></div>
+        <div class="actions">
+          <button id="unsigned-test" type="button" class="secondary">Unsigned request</button>
+          <button id="replay-test" type="button" class="secondary" disabled>Replay last signed request</button>
+          <button id="tamper-test" type="button" class="secondary" disabled>Tamper with signed body</button>
+        </div>
+        <p class="hint small">These should fail with HTTP 401. The server must reject them without running the protected operation.</p>
+      </section>
+    </div>
+    <section class="panel" aria-labelledby="activity-title">
+      <div class="panel-head"><span class="step">03</span><h2 id="activity-title">Request log</h2><button id="clear-log" class="text-button" type="button">Clear</button></div>
+      <pre id="log" class="log" aria-live="polite">Ready.</pre>
+    </section>
+    <footer>Demo only · Private keys are never sent to the Node server · Test on localhost; use HTTPS for remote deployment</footer>
+  </main>
+</body>
+</html>
