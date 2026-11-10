@@ -151,3 +151,4 @@ vite.config.ts.timestamp-*
 .DS_Store
 backend/data/
 backend/node_modules/
+*.log

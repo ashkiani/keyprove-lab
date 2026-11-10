@@ -1,3 +1,8 @@
+import {
+  COVERED_GET, COVERED_POST, SIGNATURE_ALGORITHM, SIGNATURE_TAG,
+  signatureInput, signatureBase, signatureHeader, contentDigest, jwkThumbprintSource
+} from './http-signatures.js';
+
 'use strict';
 
 // Vanilla JS + browser-native Web Crypto + IndexedDB. No crypto dependencies.
@@ -182,15 +187,46 @@ function checked(response) {
   if (!response.ok) throw new Error(`${response.status} ${response.data.code}: ${response.data.message}`);
   return response.data;
 }
-async function b64Digest(text) {
-  return toB64url(await crypto.subtle.digest('SHA-256', utf8.encode(text)));
+function bytesToBase64(bytes) {
+  let raw = '';
+  for (const byte of new Uint8Array(bytes)) raw += String.fromCharCode(byte);
+  return btoa(raw);
 }
 async function authHeaders(email, privateKey, nonce, method, path, bodyText) {
-  const digest = await b64Digest(bodyText);
-  const message = ['AUTH-DEMO-V1', window.location.origin, email, nonce, method, path, digest].join('\n');
-  const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, utf8.encode(message));
-  return { 'X-Auth-Email': email, 'X-Auth-Nonce': nonce, 'X-Auth-Signature': toB64url(sig) };
+  const bundle = findBundle(email);
+  if (!bundle) throw new Error('The encrypted local key bundle is missing');
+  // RFC 7638 JWK thumbprint. The key ID changes only when the public key changes,
+  // so existing encrypted backups and database public keys remain compatible.
+  const keyHash = await crypto.subtle.digest('SHA-256',
+    utf8.encode(jwkThumbprintSource(bundle.publicKey)));
+  const keyid = 'jwk-sha256-' + toB64url(keyHash);
+  const covered = method === 'POST' ? COVERED_POST : COVERED_GET;
+  const parameters = [
+    ['created', Math.floor(Date.now() / 1000)],
+    ['nonce', nonce],
+    ['keyid', keyid],
+    ['alg', SIGNATURE_ALGORITHM],
+    ['tag', SIGNATURE_TAG]
+  ];
+  const fields = {};
+  const headers = {};
+  if (method === 'POST') {
+    const bodyDigest = await crypto.subtle.digest('SHA-256', utf8.encode(bodyText));
+    const digest = contentDigest(bytesToBase64(bodyDigest));
+    fields['content-type'] = 'application/json';
+    fields['content-digest'] = digest;
+    headers['Content-Type'] = fields['content-type'];
+    headers['Content-Digest'] = digest;
+  }
+  const base = signatureBase({ components: covered, parameters,
+    method, targetUri: new URL(path, window.location.origin).href, fields });
+  const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' },
+    privateKey, utf8.encode(base));
+  headers['Signature-Input'] = signatureInput(covered, parameters);
+  headers.Signature = signatureHeader(bytesToBase64(sig));
+  return headers;
 }
+
 async function signedRequest(method, path, body, { remember = true } = {}) {
   if (!activePrivateKey || !activeEmail) throw new Error('Unlock a private key first');
   const key = activePrivateKey;
@@ -198,7 +234,6 @@ async function signedRequest(method, path, body, { remember = true } = {}) {
   const bodyText = body === undefined ? '' : JSON.stringify(body);
   const { nonce } = checked(await requestJson('/api/challenge', { method: 'POST', body: { email } }));
   const headers = await authHeaders(email, key, nonce, method, path, bodyText);
-  if (body !== undefined) headers['Content-Type'] = 'application/json';
   const response = await requestJson(path, {
     method, headers,
     ...(body === undefined ? {} : { body: bodyText })
@@ -355,8 +390,8 @@ async function tamperTest() {
   const result = await requestJson(path, { method: 'POST',
     body: JSON.stringify({ text: 'TAMPERED: this text was NOT signed' }), headers });
   log(`BODY TAMPERING TEST → HTTP ${result.status}`, result.data);
-  show(result.status === 401 && result.data.code === 'BAD_SIGNATURE'
-    ? 'Body tampering correctly rejected: the signed body hash does not match.'
+  show(result.status === 401 && result.data.code === 'BAD_DIGEST'
+    ? 'Body tampering correctly rejected: Content-Digest does not match the received body.'
     : `Unexpected tampering result: HTTP ${result.status}`, result.status === 401 ? 'good' : 'error');
 }
 

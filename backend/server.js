@@ -1,5 +1,5 @@
 /**
- * Browser Key Authentication prototype — zero third-party dependencies.
+ * KeyProve Lab — RFC 9421 request-signing prototype, zero third-party dependencies.
  * HTTP: built-in node:http. Cryptography: built-in node:crypto.
  * Local JSON simulates the user database. Replace it with a DB later.
  */
@@ -8,6 +8,11 @@ import { createHash, createPublicKey, randomBytes, timingSafeEqual, verify as ve
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  COVERED_GET, COVERED_POST, SIGNATURE_ALGORITHM, SIGNATURE_TAG,
+  parseSignatureInput, parseSignatureHeader, parseContentDigest, signatureBase,
+  jwkThumbprintSource
+} from '../frontend/http-signatures.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FRONTEND = join(HERE, '../frontend');
@@ -75,8 +80,19 @@ function verifyP256(key, message, signature) {
 function registrationMessage(email, enrollToken, challenge, jwk) {
   return ['ENROLL-V1', APP_ORIGIN, email, enrollToken, challenge, jwk.x, jwk.y].join('\n');
 }
-function requestMessage(email, nonce, method, pathAndQuery, bodyHash) {
-  return ['AUTH-DEMO-V1', APP_ORIGIN, email, nonce, method, pathAndQuery, bodyHash].join('\n');
+// RFC 9421 replaces the old custom AUTH-DEMO-V1 requestMessage() wire format.
+function keyIdFor(publicKey) {
+  return 'jwk-sha256-' + sha256B64(Buffer.from(jwkThumbprintSource(publicKey), 'utf8'));
+}
+function signatureHeaderOnce(req, name) {
+  let count = 0;
+  for (let i = 0; i < req.rawHeaders.length; i += 2) {
+    if (req.rawHeaders[i].toLowerCase() === name) count++;
+  }
+  if (count !== 1 || typeof req.headers[name] !== 'string') {
+    throw new HttpError(401, 'BAD_SIGNATURE', `Expected exactly one ${name} header`);
+  }
+  return req.headers[name];
 }
 function rateLimit(name, identity, max) {
   const k = `${name}:${identity}`;
@@ -130,26 +146,81 @@ async function parseBody(req) {
   return { body, rawBody };
 }
 function signedIdentity(req, rawBody) {
-  const email = emailOf(req.headers['x-auth-email']);
-  const nonce = req.headers['x-auth-nonce'];
-  const signature = req.headers['x-auth-signature'];
-  if (!email || !nonce || !signature || !db.users[email]) {
-    throw new HttpError(401, 'AUTH_REQUIRED', 'Signed request required');
+  if (!req.headers['signature'] || !req.headers['signature-input']) {
+    throw new HttpError(401, 'AUTH_REQUIRED', 'RFC 9421 signed request required');
   }
-  const pending = pendingChallenges.get(nonce);
-  pendingChallenges.delete(nonce); // Synchronous one-time consumption BEFORE applying the requested action.
+  let input, encodedSignature;
+  try {
+    input = parseSignatureInput(signatureHeaderOnce(req, 'signature-input'));
+    encodedSignature = parseSignatureHeader(signatureHeaderOnce(req, 'signature'));
+  } catch {
+    throw new HttpError(401, 'BAD_SIGNATURE', 'Malformed or unsupported RFC 9421 signature');
+  }
+  const { components, parameters, metadata } = input;
+  const expectedComponents = req.method === 'POST' ? COVERED_POST : COVERED_GET;
+  // Application verification policy: exactly these components must be signed.
+  if (components.length !== expectedComponents.length
+      || expectedComponents.some(c => !components.includes(c))
+      || metadata.alg !== SIGNATURE_ALGORITHM || metadata.tag !== SIGNATURE_TAG
+      || typeof metadata.keyid !== 'string' || !/^jwk-sha256-[A-Za-z0-9_-]{43}$/.test(metadata.keyid)
+      || !b64url(metadata.nonce, 43) || !Number.isSafeInteger(metadata.created)
+      || Math.abs(Date.now() / 1000 - metadata.created) > 90) {
+    throw new HttpError(401, 'BAD_SIGNATURE', 'Signature does not meet KeyProve verification policy');
+  }
+  // keyid is the RFC 7638 thumbprint of the registered JWK (not a user-supplied email).
+  let email = null;
+  for (const [candidate, user] of Object.entries(db.users)) {
+    try {
+      if (keyIdFor(publicKeyFromJwk(user.publicKey).jwk) === metadata.keyid) {
+        email = candidate;
+        break;
+      }
+    } catch { /* Ignore malformed or unsupported stored user keys. */ }
+  }
+  if (!email) throw new HttpError(401, 'AUTH_REQUIRED', 'Unregistered signing key');
+  const pending = pendingChallenges.get(metadata.nonce);
+  pendingChallenges.delete(metadata.nonce); // Atomic within the single Node event loop.
   if (!pending || pending.email !== email || pending.expires < Date.now()) {
     throw new HttpError(401, 'CHALLENGE_USED', 'Challenge missing, expired, or already used');
   }
-  try {
-    const { key } = publicKeyFromJwk(db.users[email].publicKey);
-    const msg = requestMessage(email, nonce, req.method, req.url, sha256B64(rawBody));
-    if (!verifyP256(key, msg, signature)) {
-      throw new HttpError(401, 'BAD_SIGNATURE', 'Signature does not match this request');
+  let fields = {};
+  if (req.method === 'POST') {
+    try {
+      const contentType = signatureHeaderOnce(req, 'content-type');
+      const digestHeader = signatureHeaderOnce(req, 'content-digest');
+      // Signing Content-Digest alone is insufficient: RFC 9530 also requires
+      // recomputing it over the exact received HTTP content bytes.
+      const expectedDigest = createHash('sha256').update(rawBody).digest();
+      const claimedB64 = parseContentDigest(digestHeader);
+      const claimedDigest = Buffer.from(claimedB64, 'base64');
+      if (claimedDigest.length !== 32 || claimedDigest.toString('base64') !== claimedB64
+          || !timingSafeEqual(expectedDigest, claimedDigest)) {
+        throw new HttpError(401, 'BAD_DIGEST', 'Content-Digest does not match the received bytes');
+      }
+      fields = { 'content-type': contentType, 'content-digest': digestHeader };
+    } catch (err) {
+      if (err instanceof HttpError) throw err;
+      throw new HttpError(401, 'BAD_DIGEST', 'Invalid or missing Content-Digest');
     }
-  } catch (err) {
-    if (err instanceof HttpError) throw err;
-    throw new HttpError(401, 'BAD_SIGNATURE', 'Signature verification failed');
+  }
+  try {
+    // The external origin is configuration, not an untrusted forwarding header.
+    // The Host and Origin have already been checked by the request handler.
+    if (!req.url.startsWith('/') || req.url.startsWith('//') || req.url.includes('#')) {
+      throw new Error('Unsupported request target form');
+    }
+    const uri = new URL(req.url, APP_ORIGIN).href;
+    const base = signatureBase({ components, parameters, method: req.method,
+      targetUri: uri, fields });
+    const signatureBytes = Buffer.from(encodedSignature, 'base64');
+    const { key } = publicKeyFromJwk(db.users[email].publicKey);
+    if (signatureBytes.length !== 64 || signatureBytes.toString('base64') !== encodedSignature
+        || !verifySignature('sha256', Buffer.from(base, 'ascii'),
+          { key, dsaEncoding: 'ieee-p1363' }, signatureBytes)) {
+      throw new Error('Invalid ECDSA signature');
+    }
+  } catch {
+    throw new HttpError(401, 'BAD_SIGNATURE', 'RFC 9421 signature does not match this request');
   }
   return email;
 }
@@ -211,7 +282,7 @@ function handlePrivate(req, res, route, body, rawBody) {
   const email = signedIdentity(req, rawBody);
   if (route === '/api/private/me' && req.method === 'GET') {
     return response(res, 200, { ok: true, email, registeredAt: db.users[email].createdAt,
-      mechanism: 'ECDSA P-256 signed requests' });
+      mechanism: 'RFC 9421 ECDSA P-256 HTTP Message Signatures' });
   }
   if (route === '/api/private/notes' && req.method === 'GET') {
     return response(res, 200, { ok: true, notes: db.notes[email] || [] });
@@ -234,6 +305,7 @@ function serveFrontend(res, route) {
     '/': ['index.html', 'text/html; charset=utf-8'],
     '/index.html': ['index.html', 'text/html; charset=utf-8'],
     '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
+    '/http-signatures.js': ['http-signatures.js', 'text/javascript; charset=utf-8'],
     '/styles.css': ['styles.css', 'text/css; charset=utf-8']
   };
   const entry = files[route];
@@ -255,7 +327,7 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, APP_ORIGIN);
     const route = url.pathname;
     if (route === '/api/health' && req.method === 'GET') {
-      return response(res, 200, { ok: true, name: 'Browser Key Auth demo' });
+      return response(res, 200, { ok: true, name: 'KeyProve Lab (RFC 9421)' });
     }
     // Do not permit GET requests with bodies (the signature always covers an empty GET body).
     if (req.method === 'GET' && (req.headers['transfer-encoding']
@@ -290,7 +362,7 @@ cleaner.unref();
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   server.listen(PORT, HOST, () => {
-    console.log(`\nBrowser Key Auth prototype: ${APP_ORIGIN}`);
+    console.log(`\nKeyProve Lab (RFC 9421): ${APP_ORIGIN}`);
     console.log(`Demo JSON database: ${DATA_FILE}`);
     console.log('One-time invitation codes (server terminal only):');
     if (inviteCodes.size === 0) console.log('  No eligible unregistered users.');
@@ -298,4 +370,4 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     console.log('Local HTTP is for localhost testing. Deploy with HTTPS only.\n');
   });
 }
-export { server, requestMessage, registrationMessage };
+export { server, keyIdFor, registrationMessage };

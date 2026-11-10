@@ -4,16 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Browser Key Authentication — Prototype</title>
+  <title>KeyProve Lab — RFC 9421 Prototype</title>
   <link rel="stylesheet" href="/styles.css">
-  <script defer src="/app.js"></script>
+  <script type="module" src="/app.js"></script>
 </head>
 <body>
   <main class="page">
     <header class="masthead">
       <div class="mark" aria-hidden="true">◇</div>
-      <div><p class="eyebrow">SECURITY PROTOTYPE</p><h1>Browser Key Authentication</h1>
-      <p class="subtitle">Password-encrypted private keys · Signed API requests · No bearer session cookies</p></div>
+      <div><p class="eyebrow">SECURITY PROTOTYPE</p><h1>KeyProve Lab</h1>
+      <p class="subtitle">Encrypted browser keys · RFC 9421 signed requests · No bearer session cookies</p></div>
       <span id="status" class="status">Starting…</span>
     </header>
 
@@ -72,7 +72,7 @@
 
       <section class="panel" aria-labelledby="api-title">
         <div class="panel-head"><span class="step">02</span><h2 id="api-title">Signed API requests</h2></div>
-        <p class="hint">Every protected call requests a fresh server challenge, then signs the method, URL, exact body digest, identity, and nonce.</p>
+        <p class="hint">Every protected call requests a fresh one-time challenge, then uses RFC 9421 HTTP Message Signatures to bind the method, target URL, key identity, and (for POST) the content type and body digest.</p>
         <div id="api-locked" class="locked-message">Unlock a local key to make authenticated requests.</div>
         <div id="api-unlocked" hidden>
           <div class="actions">
@@ -99,7 +99,7 @@
       <div class="panel-head"><span class="step">03</span><h2 id="activity-title">Request log</h2><button id="clear-log" class="text-button" type="button">Clear</button></div>
       <pre id="log" class="log" aria-live="polite">Ready.</pre>
     </section>
-    <footer>Demo only · Private keys are never sent to the Node server · Test on localhost; use HTTPS for remote deployment</footer>
+    <footer>RFC 9421 proof of concept · Private keys are never sent to the Node server · Test on localhost; use HTTPS for remote deployment</footer>
   </main>
 </body>
 </html>

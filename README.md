@@ -1,6 +1,6 @@
-# Browser Key Authentication — prototype
+# KeyProve Lab — RFC 9421 prototype
 
-A working **vanilla HTML/CSS/JavaScript frontend** and **Node.js backend** demonstrating password-encrypted private keys and **per-request public-key signatures**. No npm packages, frameworks, crypto libraries, or external services are required. Node's built-in `node:http` is sufficient for this small API, so Express is deliberately not included.
+A working **vanilla HTML/CSS/JavaScript frontend** and **Node.js backend** demonstrating password-encrypted private keys and **RFC 9421 HTTP Message Signatures on every protected API request**. No npm packages, frameworks, crypto libraries, or external services are required. Node's built-in `node:http` is sufficient for this small API, so Express is deliberately not included.
 
 > **A prototype, not a production identity system.** Use `localhost` for testing. HTTPS and further operational hardening are required before exposing this service to other machines.
 
@@ -10,7 +10,7 @@ A working **vanilla HTML/CSS/JavaScript frontend** and **Node.js backend** demon
 - A current browser with Web Crypto and IndexedDB (Chrome, Edge, Firefox, Safari).
 
 1. Extract the ZIP.
-2. Open a terminal in the extracted `browser-key-auth-prototype` folder.
+2. Open a terminal in the extracted `keyprove-lab-rfc9421` folder.
 3. Run:
 
    ```bash
@@ -30,11 +30,21 @@ The console shows the **actual invitation codes**. They are **not hardcoded, shi
 
 The Node backend serves the static frontend and API from the **same origin**, avoiding CORS complexity. It listens on `127.0.0.1` by default, not on the public network.
 
+### Upgrading from the original prototype
+
+If you previously registered `alice@example.com` or `bob@example.com`, your browser still has its password-encrypted private key, and the original Node server has the matching public key in its created `backend/data/db.json` file. To retain both:
+
+1. Stop the old Node server.
+2. **Copy the old `backend/data/db.json` into the new project's `backend/data/db.json`**, or replace the source files in your existing directory **without deleting its data file**. It is excluded from Git/ZIP on purpose because it is runtime data.
+3. Start the updated backend with `npm start` at the **same** `http://localhost:3000` origin. Your old IndexedDB keys and encrypted backups are still usable; no re-enrollment is needed. Do not run both versions on the same port.
+
+Without the original server database, the newly started backend will not recognize the existing public key even though your browser still has the encrypted private key. Keep a backup of both the encrypted key file and server data before upgrading. Requests from a still-open old frontend tab will fail until reloaded because the old `X-Auth-*` signing format is no longer accepted.
+
 ### Try the complete flow
 
 1. **Register:** Expand **Register a new account**, enter `alice@example.com`, paste the matching one-time code from the Node terminal, and select a password of at least 12 characters. Click **Authorize and register**. The server validates the invitation *before* the browser generates the key pair. On success the status changes to **Unlocked**.
 2. **Make a protected request:** Click **GET /api/private/me**. The log should show **HTTP 200** and your email. Click **POST signed note** with a note and then **GET /api/private/notes**. The note should appear.
-3. **Try the attacks:** Click **Replay last signed request**, **Tamper with signed body**, and **Unsigned request**. All should report **HTTP 401**. The replay test should report `CHALLENGE_USED`; tampering should report `BAD_SIGNATURE`; an unsigned request should report `AUTH_REQUIRED`.
+3. **Try the attacks:** Click **Replay last signed request**, **Tamper with signed body**, and **Unsigned request**. All should report **HTTP 401**. The replay test reports `CHALLENGE_USED`, body tampering reports `BAD_DIGEST` (RFC 9530), and an unsigned request reports `AUTH_REQUIRED`.
 4. **Lock/unlock:** Click **Lock now**. Your private key is discarded from the page's active JavaScript state. Enter a *wrong* password (it should fail), then the correct password (it should unlock). A page refresh also locks it.
 5. **Export:** Click **Export encrypted backup**. Save the resulting JSON file. It contains the email, public key, PBKDF2 parameters and an **AES-GCM encrypted PKCS#8 private key**—not the plaintext private key.
 6. **Delete:** Click **Delete local key**, then confirm. Status becomes **No local key**. **This deletes the browser copy only**; the server still recognizes that public key.
@@ -46,20 +56,22 @@ After registering, the server does not show another invitation for that same ema
 ## Folder layout
 
 ```text
-browser-key-auth-prototype/
+keyprove-lab/
 ├── README.md
 ├── package.json     Node scripts, zero dependencies
 ├── frontend/
 │   ├── index.html     HTML UI
 │   ├── styles.css     CSS only
-│   └── app.js         IndexedDB + Web Crypto + request signing
+│   ├── app.js         IndexedDB + Web Crypto + request signing
+│   └── http-signatures.js  Shared RFC 9421 request-signing profile
 ├── backend/
 │   ├── server.js      Node HTTP server + built-in crypto
 │   ├── .gitignore
 │   └── data/db.json   Created after registration; never commit real user data
 └── tests/
     ├── auth.test.js           HTTP integration/security tests
-    └── browser-crypto.test.js Browser cryptography functions tested via Node Web Crypto
+    ├── browser-crypto.test.js Browser cryptography functions tested via Node Web Crypto
+    └── http-signatures.test.js RFC 9421 reference vector + Structured Fields tests
 ```
 
 ## How it works
@@ -73,23 +85,39 @@ browser-key-auth-prototype/
 **Every protected API request** (there is **no login session or bearer cookie**):
 
 1. Client calls `POST /api/challenge` with the registered email.
-2. Server returns 32 random bytes encoded as a base64url nonce (expires in 60 seconds).
-3. Client signs the following UTF-8 string with ECDSA P-256 + SHA-256, with each field separated by a newline:
+2. Server returns an unpredictable, one-time, 32-byte nonce (base64url) valid for 60 seconds.
+3. Browser calculates an **RFC 7638 JWK SHA-256 thumbprint** from the existing public key to use as a stable `keyid`. This does not alter or re-encrypt the local backup.
+4. Browser constructs the RFC 9421 `Signature-Input` Inner List with required `created`, `nonce`, `keyid`, `alg="ecdsa-p256-sha256"`, and `tag="keyprove-v1"` parameters. `@method` and `@target-uri` are always covered; POST also covers `content-type` and `content-digest`.
+5. POST requests contain an RFC 9530 `Content-Digest: sha-256=:...:` computed over **the exact HTTP body bytes**. The browser generates the RFC 9421 signature base and signs it with the existing unlocked ECDSA P-256 private key using SHA-256.
+6. Browser sends normal RFC 9421 `Signature-Input` and `Signature` headers (no `X-Auth-*` headers). The signature bytes are the standard 64-byte P1363/`r || s` ECDSA representation encoded as an RFC Structured Field byte sequence (standard Base64).
+7. Backend parses/validates signature metadata, checks the registered `keyid`, consumes the one-time challenge, enforces mandatory component coverage, validates the body digest against the received bytes, builds the **same RFC 9421 signature base**, and verifies the public-key signature before executing the request.
 
-   ```text
-   AUTH-DEMO-V1
-   http://localhost:3000
-   alice@example.com
-   <nonce>
-   POST
-   /api/private/notes
-   <base64url SHA256 of exact HTTP body bytes>
-   ```
+Illustrative signed POST request (placeholders are not valid signatures):
 
-4. Client sends the actual API request with `X-Auth-Email`, `X-Auth-Nonce`, and `X-Auth-Signature` headers, including the body when needed.
-5. Backend consumes the nonce **once**, checks that it belongs to that email and has not expired, reconstructs the signed message from the **actual HTTP method, raw request URL and raw body bytes**, verifies the signature against the registered public key, and only then executes the operation.
+```http
+POST /api/private/notes HTTP/1.1
+Host: localhost:3000
+Content-Type: application/json
+Content-Digest: sha-256=:<BASE64_SHA256_OF_BODY>:
+Signature-Input: sig1=("@method" "@target-uri" "content-type" "content-digest");created=1794330000;nonce="<NONCE>";keyid="jwk-sha256-<JWK_THUMBPRINT>";alg="ecdsa-p256-sha256";tag="keyprove-v1"
+Signature: sig1=:<BASE64_SIGNATURE>:
 
-The signature is bound to the **server origin, user, nonce, method, URL (including query), and body hash**. Intercepted signed requests cannot be successfully replayed *after the nonce is consumed*; intercepted messages are still subject to active relay/race attacks without proper TLS. Request signing adds an extra round trip per protected operation.
+{"text":"Hello"}
+```
+
+The RFC 9421 signature base for that request has the following structure:
+
+```text
+"@method": POST
+"@target-uri": http://localhost:3000/api/private/notes
+"content-type": application/json
+"content-digest": sha-256=:<BASE64_SHA256_OF_BODY>:
+"@signature-params": ("@method" "@target-uri" "content-type" "content-digest");created=1794330000;nonce="<NONCE>";keyid="jwk-sha256-<JWK_THUMBPRINT>";alg="ecdsa-p256-sha256";tag="keyprove-v1"
+```
+
+**Supported RFC 9421 profile, not a general-purpose RFC 9421 toolkit:** KeyProve generates valid RFC 9421 request signatures for the specific component sets above. The verifier deliberately accepts **only one signature labelled `sig1`**, requires exactly the specified metadata and coverage, and supports only ECDSA P-256/SHA-256. It does not implement arbitrary covered component identifiers, request signature negotiation (`Accept-Signature`), other signature algorithms, multiple signatures, or response signing. Such signatures may be RFC-compliant but are intentionally rejected by KeyProve's stricter application policy. This profile follows the RFC's mechanism and is tested against the RFC's official ECDSA P-256 example, **but the prototype has not been independently security audited or certified**.
+
+**Backward compatibility:** Existing v1 IndexedDB encrypted key records, exports, and server JSON databases remain readable without re-registration **provided you retain the original server database**. The previous custom `AUTH-DEMO-V1` / `X-Auth-*` request authentication **is intentionally replaced**, not accepted alongside RFC 9421. Both sides must run the updated version. New request signatures cannot be replayed after challenge consumption; signed request-body metadata cannot be substituted without detection.
 
 ### API endpoints
 
@@ -119,7 +147,7 @@ Or without npm, from the project root:
 node --test tests/*.test.js
 ```
 
-Tests cover: unauthorized enrollment, successful public-key registration, missing signatures, signed GET/POST, challenge replay, altered request bodies, account isolation, wrong-key signatures, Origin rejection, encrypted key export format, correct/wrong decryption passwords, non-extractable imported keys, and tampered backups. They use only Node's standard library.
+Tests cover: unauthorized enrollment, successful public-key registration, RFC 9421 signed GET/POST using the actual frontend signer, challenge replay, altered request bodies/digests, path/header tampering, malformed and under-covered signatures, algorithm/tag enforcement, account isolation, wrong-key signatures, Origin rejection, and encryption/decryption of non-extractable private keys. The RFC signing tests additionally verify the **official ECDSA P-256 reference signature from RFC 9421 Appendix B.2.4**. They use only Node's standard library.
 
 ## Important security boundaries
 
@@ -159,4 +187,7 @@ In `backend/server.js`, replace the `loadDatabase()` and `saveDatabase()` JSON-f
 
 - [MDN — Web Crypto API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Crypto_API)
 - [OWASP — Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)
-- [RFC 9421 — HTTP Message Signatures](https://www.rfc-editor.org/rfc/rfc9421.html) (conceptual guidance; this prototype's educational wire format is **not** a conforming implementation of RFC 9421)
+- [RFC 9421 — HTTP Message Signatures](https://www.rfc-editor.org/rfc/rfc9421.html), especially §§2.3, 2.5, 3.3.4, 4 and Appendix B.2.4
+- [RFC 9530 — Digest Fields](https://www.rfc-editor.org/rfc/rfc9530.html)
+- [RFC 7638 — JSON Web Key (JWK) Thumbprint](https://www.rfc-editor.org/rfc/rfc7638.html)
+- [RFC 8941 — Structured Field Values for HTTP](https://www.rfc-editor.org/rfc/rfc8941.html) (base field format; current update is RFC 9651)
